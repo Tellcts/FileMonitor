@@ -24,10 +24,10 @@ from logging.handlers import RotatingFileHandler
 
 # ===================== 常量 =====================
 VERSION = "1.0.0"  # 版本号
-DEFAULT_CONFIG_FILE = "monitor_config.json"  # 默认配置文件
-DEFAULT_HASH_DB_FILE = "file_hashes.json"  # 默认文件哈希数据库
-DEFAULT_LOG_FILE = "file_monitor.log"  # 默认日志文件
-MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB         # 日志文件最大容量
+DEFAULT_CONFIG_FILE = "./FileMonitor/monitor_config.json"  # 默认配置文件
+DEFAULT_HASH_DB_FILE = "./FileMonitor/files_hash_db.json"  # 默认文件哈希数据库
+DEFAULT_LOG_FILE = "./FileMonitor/file_monitor.log"  # 默认日志文件
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 日志文件最大容量（10MB）
 BACKUP_COUNT = 5  # 备份日志个数
 DEFAULT_SCAN_INTERVAL = 60  # 默认扫描间隔
 
@@ -39,11 +39,11 @@ class SMTPConfig:
     smtp_port: int = 465
     use_ssl: bool = True
     use_tls: bool = False
-    username: str = ""
-    password: str = ""
-    sender: str = ""
-    receivers: list = field(default_factory=list)
-    mail_subject_prefix: str = "[文件监控告息]"
+    username: str = ""  # 用户名，一般也是发件人邮箱
+    password: str = ""  # SMTP授权码
+    sender: str = ""  # 发送者邮箱
+    receivers: list = field(default_factory=list)  # 接收者邮箱
+    mail_subject_prefix: str = "[文件监控告警]"  # 邮箱标题前缀
 
 
 @dataclass
@@ -70,6 +70,7 @@ class ConfigManager:
         self.config = MonitorConfig()
 
     def load(self) -> MonitorConfig:
+        """加载配置文件。如果没有配置文件，生成默认配置模板文件"""
         if not os.path.exists(self.config_path):
             self._save_default_template()
             return self.config
@@ -87,7 +88,7 @@ class ConfigManager:
                 sender=smtp_data.get("sender", ""),
                 receivers=smtp_data.get("receivers", []),
                 mail_subject_prefix=smtp_data.get(
-                    "mail_subject_prefix", "[文件监控告息]"
+                    "mail_subject_prefix", "[文件监控告警]"
                 ),
             )
             self.config = MonitorConfig(
@@ -108,20 +109,27 @@ class ConfigManager:
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             raise ValueError(f"配置文件格式错误: {e}")
 
+    """ 验证配置是否合法 """
+
     def _validate(self):
         algo = self.config.hash_algorithm.lower()
         if algo not in ("md5", "sha256", "both"):
             raise ValueError(f"不支持的哈希算法: {algo}，可选: md5, sha256, both")
-        if self.config.scan_interval < 5:
-            self.config.scan_interval = 5
+
         if not self.config.watch_files and not self.config.watch_dirs:
             raise ValueError(
                 "请至少配置一个监控文件(watch_files)或监控目录(watch_dirs)"
             )
+
+        if self.config.scan_interval < 5:
+            self.config.scan_interval = 5
+
+        """ SMTP Sender 未配置时，使用 SMTP Username 作为发送者邮箱配置"""
         if self.config.smtp.receivers and not self.config.smtp.sender:
             self.config.smtp.sender = self.config.smtp.username
 
     def _save_default_template(self):
+        """生成默认配置模板文件"""
         template = {
             "watch_files": ["/etc/passwd", "/etc/hosts"],
             "watch_dirs": ["/etc/nginx", "/etc/ssh"],
@@ -142,7 +150,7 @@ class ConfigManager:
                 "password": "your_smtp_auth_code",
                 "sender": "your_email@qq.com",
                 "receivers": ["admin@example.com"],
-                "mail_subject_prefix": "[文件监控告息]",
+                "mail_subject_prefix": "[文件监控告警]",
             },
         }
         with open(self.config_path, "w", encoding="utf-8") as f:
@@ -162,10 +170,11 @@ class HashCalculator:
         result = {"size": 0, "mtime": ""}
         if not os.path.isfile(filepath):
             return result
+
         try:
-            stat = os.stat(filepath)
-            result["size"] = stat.st_size
-            result["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            file_stat = os.stat(filepath)
+            result["size"] = file_stat.st_size
+            result["mtime"] = datetime.fromtimestamp(file_stat.st_mtime).isoformat()
         except OSError:
             return result
 
@@ -196,8 +205,7 @@ class HashCalculator:
     def is_hash_changed(old_record: dict, new_record: dict) -> bool:
         for key in ("md5", "sha256"):
             if key in old_record and key in new_record:
-                if old_record[key] != new_record[key]:
-                    return True
+                return old_record[key] != new_record[key]
         return False
 
 
@@ -271,7 +279,7 @@ class EmailAlerter:
             try:
                 return self._do_send(subject, body, html)
             except Exception as e:
-                self.logger.error(f"邮件发送失败 (第{attempt}次尝试): {e}")
+                self.logger.error(f"(第 {attempt} 次尝试)邮件发送失败: {e}")
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay)
                 else:
@@ -305,6 +313,7 @@ class EmailAlerter:
             server = smtplib.SMTP(
                 self.config.smtp_server, self.config.smtp_port, timeout=30
             )
+
         try:
             if self.config.use_tls and not self.config.use_ssl:
                 server.starttls()
@@ -330,11 +339,6 @@ class EmailAlerter:
             file_path = change.get("file", "未知")
             change_type = change.get("type", "unknown")
             details = change.get("details", "-")
-            badge_class = {
-                "modified": "badge-modified",
-                "deleted": "badge-deleted",
-                "created": "badge-created",
-            }.get(change_type, "badge-modified")
             type_label = {
                 "modified": "文件被修改",
                 "deleted": "文件被删除",
@@ -402,7 +406,7 @@ class FileScanner:
         self.config = config
         self.exclude = set(self.DEFAULT_EXCLUDE)
         self.exclude.update(p.strip().lower() for p in config.exclude_patterns)
-        self.logger = logging.getLogger("file_monitor.scanner")
+        self.logger = logging.getLogger("FILE_MONITOR_ENGINE")
 
     def get_all_target_files(self) -> set:
         files = set()
@@ -437,6 +441,7 @@ class FileScanner:
         return files
 
     def _is_excluded(self, name: str, is_dir: bool = False) -> bool:
+        """判断文件是否是忽略的目标"""
         name_lower = name.lower()
         for pattern in self.exclude:
             if pattern.startswith("*") and pattern.endswith("*"):
@@ -459,7 +464,7 @@ class FileMonitorEngine:
 
     def __init__(self, config: MonitorConfig):
         self.config = config
-        self.logger = logging.getLogger("file_monitor.engine")
+        self.logger = logging.getLogger("FILE_MONITOR_ENGINE")
         self.hash_db = HashDatabase(config.hash_db_file)
         self.scanner = FileScanner(config)
         self.alerter = EmailAlerter(config.smtp, config.max_retries, config.retry_delay)
@@ -468,15 +473,15 @@ class FileMonitorEngine:
 
     def start(self, once: bool = False):
         self.logger.info("=" * 60)
-        self.logger.info("文件监控告警系统启动")
+        self.logger.info("文件监控告警系统启动...")
         self.logger.info(f"版本: {VERSION}")
         self.logger.info(f"哈希算法: {self.config.hash_algorithm}")
         self.logger.info(f"扫描间隔: {self.config.scan_interval} 秒")
         self.logger.info(f"哈希数据库: {self.config.hash_db_file}")
         self.logger.info("=" * 60)
 
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)  # 监听中断信号（Ctrl+C）
+        signal.signal(signal.SIGTERM, self._signal_handler)  # 监听终止信号（Kill）
 
         self._initialize_baseline()
         if once:
@@ -523,21 +528,16 @@ class FileMonitorEngine:
 
         # 检测修改与新增
         for filepath in sorted(target_files):
-            # try:
-            #     new_record = HashCalculator.compute_hash(
-            #         filepath, self.config.hash_algorithm
-            #     )
-            #     old_record = self.hash_db.get(filepath)
             try:
                 # 【优化点：mtime 预检，跳过未修改的文件】
                 old_record = self.hash_db.get(filepath)
                 if old_record is not None:
                     try:
-                        stat_info = os.stat(filepath)
+                        file_stat = os.stat(filepath)
                         # 对比到纳秒级（Linux 支持 st_mtime_ns）
                         if (
                             old_record.get("mtime")
-                            == datetime.fromtimestamp(stat_info.st_mtime).isoformat()
+                            == datetime.fromtimestamp(file_stat.st_mtime).isoformat()
                         ):
                             continue  # 修改时间没变，直接跳过，不算哈希
                     except OSError:
@@ -778,6 +778,8 @@ def cmd_list(config: MonitorConfig):
 
 # ===================== 主入口 =====================
 def main():
+    if not os.path.exists("./FileMonitor"):
+        os.makedirs("./FileMonitor")
     parser = argparse.ArgumentParser(
         description="文件监控告警工具 - File Integrity Monitor & Alert System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
